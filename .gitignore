@@ -1,0 +1,26 @@
+# Environment files (NEVER COMMIT - contains private keys!)
+.env
+.env.local
+.env.*.local
+.env.mainnet
+.env.testnet
+
+# Keep the example templates
+!.env.mainnet.example
+!.env.testnet.example
+
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+
+# Dependencies
+lib/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
