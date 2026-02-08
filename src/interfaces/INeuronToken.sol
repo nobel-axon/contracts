@@ -7,7 +7,6 @@ pragma solidity ^0.8.20;
  * @dev Based on nad.fun IToken.json ABI - tokens support native burn()
  *
  * Research source: https://github.com/Naddotfun/contract-v3-abi
- * Task: monad-agent-1b4.1
  */
 interface INeuronToken {
     // ============ ERC20 Standard ============
