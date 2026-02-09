@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./interfaces/INeuronToken.sol";
 
 /**
@@ -13,9 +14,9 @@ import "./interfaces/INeuronToken.sol";
  * Economic model:
  * - Entry: MON deposit to join queue
  * - Answers: $NEURON burn per attempt (doubles each attempt per match)
- * - Settlement: 90% to winner, 5% to treasury, 5% accumulated for winner's NEURON buyback
+ * - Settlement: configurable split (default 90% winner, 5% treasury, 5% burn allocation)
  */
-contract AxonArena is Ownable, ReentrancyGuard {
+contract AxonArena is Ownable, ReentrancyGuard, Pausable {
     // ============ Type Definitions ============
 
     /**
@@ -82,8 +83,13 @@ contract AxonArena is Ownable, ReentrancyGuard {
     /// @notice The $NEURON token contract for answer fee burns
     INeuronToken public immutable neuronToken;
 
-    /// @notice Treasury address for protocol fees (5% of pool)
+    /// @notice Treasury address for protocol fees
     address public treasury;
+
+    /// @notice Prize split in basis points (10000 = 100%)
+    uint16 public winnerBps;
+    uint16 public treasuryBps;
+    uint16 public burnBps;
 
     /// @notice Authorized operators (can manage matches) - multiple addresses supported
     /// @dev Owner can add/remove operators. Agent Chief wallets should be operators.
@@ -214,12 +220,6 @@ contract AxonArena is Ownable, ReentrancyGuard {
         uint256 amount
     );
 
-    /// @notice Emitted when burn allocation is withdrawn
-    event BurnAllocationWithdrawn(
-        address indexed winner,
-        uint256 amount
-    );
-
     /// @notice Emitted when burn allocation is claimed by operator for swap
     event BurnAllocationClaimed(
         address indexed operator,
@@ -249,6 +249,9 @@ contract AxonArena is Ownable, ReentrancyGuard {
     /// @notice Emitted when treasury is changed
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
 
+    /// @notice Emitted when prize split is changed
+    event SplitUpdated(uint16 winnerBps, uint16 treasuryBps, uint16 burnBps);
+
     // ============ Errors ============
 
     error NotOperator();
@@ -268,6 +271,7 @@ contract AxonArena is Ownable, ReentrancyGuard {
     error NoBurnAllocation();
     error NoPendingRefund();
     error InvalidParameters();
+    error InvalidSplit();
 
     // ============ Modifiers ============
 
@@ -318,6 +322,11 @@ contract AxonArena is Ownable, ReentrancyGuard {
         operators[_initialOperator] = true;
         nextMatchId = 1; // Start from 1, 0 reserved for "no match"
 
+        // Default split: 90% winner, 5% treasury, 5% burn allocation
+        winnerBps = 9000;
+        treasuryBps = 500;
+        burnBps = 500;
+
         emit OperatorAdded(_initialOperator);
     }
 
@@ -364,6 +373,36 @@ contract AxonArena is Ownable, ReentrancyGuard {
         address oldTreasury = treasury;
         treasury = _treasury;
         emit TreasuryUpdated(oldTreasury, _treasury);
+    }
+
+    /**
+     * @notice Update the prize distribution split
+     * @param _winnerBps Winner share in basis points (e.g. 9000 = 90%)
+     * @param _treasuryBps Treasury share in basis points (e.g. 500 = 5%)
+     * @param _burnBps Burn allocation share in basis points (e.g. 500 = 5%)
+     * @dev All three must sum to 10000 (100%)
+     */
+    function setSplit(uint16 _winnerBps, uint16 _treasuryBps, uint16 _burnBps) external onlyOwner {
+        if (uint256(_winnerBps) + uint256(_treasuryBps) + uint256(_burnBps) != 10000) revert InvalidSplit();
+        winnerBps = _winnerBps;
+        treasuryBps = _treasuryBps;
+        burnBps = _burnBps;
+        emit SplitUpdated(_winnerBps, _treasuryBps, _burnBps);
+    }
+
+    /**
+     * @notice Pause the contract (emergency stop)
+     * @dev Prevents new queue joins and answer submissions. Does not affect settlements or refunds.
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     // ============ View Functions ============
@@ -489,6 +528,7 @@ contract AxonArena is Ownable, ReentrancyGuard {
     function joinQueue(uint256 matchId)
         external
         payable
+        whenNotPaused
         matchExists(matchId)
         onlyPhase(matchId, MatchPhase.Queue)
         nonReentrant
@@ -511,7 +551,7 @@ contract AxonArena is Ownable, ReentrancyGuard {
         // Add player to match
         matchPlayers[matchId].push(msg.sender);
         isPlayerInMatch[matchId][msg.sender] = true;
-        state.pool += msg.value;
+        state.pool += config.entryFee;
 
         // Refund excess
         if (msg.value > config.entryFee) {
@@ -625,6 +665,7 @@ contract AxonArena is Ownable, ReentrancyGuard {
      */
     function submitAnswer(uint256 matchId, string calldata answer)
         external
+        whenNotPaused
         matchExists(matchId)
         onlyPhase(matchId, MatchPhase.AnswerPeriod)
         nonReentrant
@@ -658,7 +699,7 @@ contract AxonArena is Ownable, ReentrancyGuard {
      * @notice Settle match with a winner
      * @param matchId The match ID
      * @param winner The winning agent address
-     * @dev Distributes: 90% to winner, 5% to treasury, 5% to burn allocation
+     * @dev Distribution uses configurable split (winnerBps/treasuryBps/burnBps)
      */
     function settleWinner(uint256 matchId, address winner)
         external
@@ -673,10 +714,10 @@ contract AxonArena is Ownable, ReentrancyGuard {
         MatchState storage state = matchStates[matchId];
         uint256 pool = state.pool;
 
-        // Calculate distribution (90/5/5)
-        uint256 winnerPrize = (pool * 90) / 100;
-        uint256 treasuryFee = (pool * 5) / 100;
-        uint256 burnAllocationAmount = pool - winnerPrize - treasuryFee; // Remaining ~5%
+        // Calculate distribution using configurable split
+        uint256 winnerPrize = (pool * winnerBps) / 10000;
+        uint256 treasuryFee = (pool * treasuryBps) / 10000;
+        uint256 burnAllocationAmount = pool - winnerPrize - treasuryFee;
 
         // Update state
         state.winner = winner;
@@ -724,22 +765,6 @@ contract AxonArena is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Withdraw own accumulated burn allocation
-     * @dev Anyone can withdraw their own allocation (e.g., winners)
-     */
-    function withdrawBurnAllocation() external nonReentrant {
-        uint256 amount = burnAllocation[msg.sender];
-        if (amount == 0) revert NoBurnAllocation();
-
-        burnAllocation[msg.sender] = 0;
-
-        (bool success,) = payable(msg.sender).call{value: amount}("");
-        require(success, "Withdrawal failed");
-
-        emit BurnAllocationWithdrawn(msg.sender, amount);
-    }
-
-    /**
      * @notice Claim burn allocation on behalf of a winner for NEURON buyback swap
      * @dev Called by operator to get winner's MON for nad.fun swap
      * @param winner The winner whose allocation to claim
@@ -761,7 +786,7 @@ contract AxonArena is Ownable, ReentrancyGuard {
     /**
      * @notice Refund match after answer period timeout with no winner
      * @param matchId The match ID
-     * @dev Distributes: 95% equally to players (credited to pendingRefunds), 5% to treasury
+     * @dev Treasury takes treasuryBps, remainder split equally to players (credited to pendingRefunds)
      */
     function refundMatch(uint256 matchId)
         external
@@ -779,8 +804,8 @@ contract AxonArena is Ownable, ReentrancyGuard {
         uint256 playerCount = players.length;
         uint256 pool = state.pool;
 
-        // Calculate distribution
-        uint256 treasuryFee = (pool * 5) / 100;
+        // Calculate distribution using configurable treasury rate
+        uint256 treasuryFee = (pool * treasuryBps) / 10000;
         uint256 refundPool = pool - treasuryFee;
         uint256 refundPerPlayer = playerCount > 0 ? refundPool / playerCount : 0;
 

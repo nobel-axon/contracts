@@ -482,33 +482,6 @@ contract AxonArenaTest is Test {
         arena.revealAnswer(matchId, CORRECT_ANSWER, ANSWER_SALT);
     }
 
-    function test_withdrawBurnAllocation_winnerCanWithdraw() public {
-        uint256 matchId = _createDefaultMatch();
-        _setupMatchToAnswerPeriod(matchId);
-
-        // Settle with player1 as winner
-        vm.prank(operator);
-        arena.settleWinner(matchId, player1);
-
-        uint256 allocation = arena.burnAllocation(player1);
-        assertTrue(allocation > 0);
-
-        // Player1 (non-operator) can now withdraw their own allocation
-        uint256 balanceBefore = player1.balance;
-
-        vm.prank(player1);
-        arena.withdrawBurnAllocation();
-
-        assertEq(player1.balance, balanceBefore + allocation);
-        assertEq(arena.burnAllocation(player1), 0);
-    }
-
-    function test_withdrawBurnAllocation_revertsIfNone() public {
-        vm.prank(player1);
-        vm.expectRevert(AxonArena.NoBurnAllocation.selector);
-        arena.withdrawBurnAllocation();
-    }
-
     function test_claimBurnAllocationFor_operatorCanClaimForWinner() public {
         uint256 matchId = _createDefaultMatch();
         _setupMatchToAnswerPeriod(matchId);
@@ -659,6 +632,50 @@ contract AxonArenaTest is Test {
         arena.cancelMatch(matchId);
     }
 
+    // ============ Pool tracking: overpayment must not inflate pool ============
+
+    function test_joinQueue_overpayment_poolTracksEntryFeeOnly() public {
+        uint256 matchId = _createDefaultMatch();
+
+        // Player1 overpays by 50 ETH
+        vm.prank(player1);
+        arena.joinQueue{value: ENTRY_FEE + 50 ether}(matchId);
+
+        // Player2 pays exact
+        _joinQueue(player2, matchId);
+
+        // Pool must equal exactly 2x entryFee, not inflated
+        AxonArena.MatchState memory state = arena.getMatchState(matchId);
+        assertEq(state.pool, ENTRY_FEE * 2);
+        assertEq(address(arena).balance, ENTRY_FEE * 2);
+    }
+
+    function test_joinQueue_overpayment_settlementSucceeds() public {
+        uint256 matchId = _createDefaultMatch();
+
+        // Player1 overpays
+        vm.prank(player1);
+        arena.joinQueue{value: ENTRY_FEE + 50 ether}(matchId);
+        _joinQueue(player2, matchId);
+
+        vm.prank(operator);
+        arena.startMatch(matchId);
+        vm.prank(operator);
+        arena.postQuestion(matchId, "Q", "math", 1, "number", answerHash);
+        vm.prank(operator);
+        arena.startAnswerPeriod(matchId);
+
+        // Settlement should succeed — pool is not inflated
+        uint256 winnerBefore = player1.balance;
+        vm.prank(operator);
+        arena.settleWinner(matchId, player1);
+
+        uint256 pool = ENTRY_FEE * 2;
+        uint256 expectedPrize = (pool * 9000) / 10000;
+        assertEq(player1.balance, winnerBefore + expectedPrize);
+        assertEq(address(arena).balance, pool - expectedPrize - (pool * 500) / 10000);
+    }
+
     function test_cancelMatch_revertsIfNotQueuePhase() public {
         uint256 matchId = _createDefaultMatch();
         _joinQueue(player1, matchId);
@@ -751,6 +768,159 @@ contract AxonArenaTest is Test {
         arena.setTreasury(newTreasury);
 
         assertEq(arena.treasury(), newTreasury);
+    }
+
+    // ============ Split Tests ============
+
+    function test_defaultSplit() public view {
+        assertEq(arena.winnerBps(), 9000);
+        assertEq(arena.treasuryBps(), 500);
+        assertEq(arena.burnBps(), 500);
+    }
+
+    function test_setSplit_success() public {
+        arena.setSplit(8000, 1000, 1000);
+
+        assertEq(arena.winnerBps(), 8000);
+        assertEq(arena.treasuryBps(), 1000);
+        assertEq(arena.burnBps(), 1000);
+    }
+
+    function test_setSplit_revertsIfNotOwner() public {
+        vm.prank(player1);
+        vm.expectRevert();
+        arena.setSplit(8000, 1000, 1000);
+    }
+
+    function test_setSplit_revertsIfNotSumTo10000() public {
+        vm.expectRevert(AxonArena.InvalidSplit.selector);
+        arena.setSplit(8000, 1000, 500); // = 9500, not 10000
+    }
+
+    function test_setSplit_affectsSettlement() public {
+        // Change to 80/10/10
+        arena.setSplit(8000, 1000, 1000);
+
+        uint256 matchId = _createDefaultMatch();
+        _setupMatchToAnswerPeriod(matchId);
+
+        uint256 pool = ENTRY_FEE * 2;
+        uint256 expectedWinnerPrize = (pool * 8000) / 10000;
+        uint256 expectedTreasuryFee = (pool * 1000) / 10000;
+        uint256 expectedBurnAllocation = pool - expectedWinnerPrize - expectedTreasuryFee;
+
+        uint256 winnerBalanceBefore = player1.balance;
+        uint256 treasuryBalanceBefore = treasury.balance;
+
+        vm.prank(operator);
+        arena.settleWinner(matchId, player1);
+
+        assertEq(player1.balance, winnerBalanceBefore + expectedWinnerPrize);
+        assertEq(treasury.balance, treasuryBalanceBefore + expectedTreasuryFee);
+        assertEq(arena.burnAllocation(player1), expectedBurnAllocation);
+    }
+
+    function test_setSplit_affectsRefund() public {
+        // Change treasury to 10%
+        arena.setSplit(8000, 1000, 1000);
+
+        uint256 matchId = _createDefaultMatch();
+        _setupMatchToAnswerPeriod(matchId);
+
+        uint256 pool = ENTRY_FEE * 2;
+        uint256 expectedTreasuryFee = (pool * 1000) / 10000;
+        uint256 expectedRefundPool = pool - expectedTreasuryFee;
+        uint256 expectedRefundPerPlayer = expectedRefundPool / 2;
+
+        vm.warp(block.timestamp + ANSWER_DURATION + 1);
+
+        uint256 treasuryBalanceBefore = treasury.balance;
+
+        vm.prank(operator);
+        arena.refundMatch(matchId);
+
+        assertEq(treasury.balance, treasuryBalanceBefore + expectedTreasuryFee);
+        assertEq(arena.pendingRefunds(player1), expectedRefundPerPlayer);
+        assertEq(arena.pendingRefunds(player2), expectedRefundPerPlayer);
+    }
+
+    // ============ Pause Tests ============
+
+    function test_pause_blocksJoinQueue() public {
+        uint256 matchId = _createDefaultMatch();
+
+        arena.pause();
+
+        vm.prank(player1);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        arena.joinQueue{value: ENTRY_FEE}(matchId);
+    }
+
+    function test_pause_blocksSubmitAnswer() public {
+        uint256 matchId = _createDefaultMatch();
+        _setupMatchToAnswerPeriod(matchId);
+
+        arena.pause();
+
+        vm.prank(player1);
+        vm.expectRevert(abi.encodeWithSignature("EnforcedPause()"));
+        arena.submitAnswer(matchId, "answer");
+    }
+
+    function test_pause_allowsSettlement() public {
+        uint256 matchId = _createDefaultMatch();
+        _setupMatchToAnswerPeriod(matchId);
+
+        arena.pause();
+
+        // Settlement should still work (so in-flight matches can resolve)
+        vm.prank(operator);
+        arena.settleWinner(matchId, player1);
+
+        AxonArena.MatchState memory state = arena.getMatchState(matchId);
+        assertEq(uint8(state.phase), uint8(AxonArena.MatchPhase.Settled));
+    }
+
+    function test_pause_allowsRefund() public {
+        uint256 matchId = _createDefaultMatch();
+        _setupMatchToAnswerPeriod(matchId);
+
+        arena.pause();
+
+        vm.warp(block.timestamp + ANSWER_DURATION + 1);
+
+        vm.prank(operator);
+        arena.refundMatch(matchId);
+
+        AxonArena.MatchState memory state = arena.getMatchState(matchId);
+        assertEq(uint8(state.phase), uint8(AxonArena.MatchPhase.Refunded));
+    }
+
+    function test_unpause_restoresOperations() public {
+        uint256 matchId = _createDefaultMatch();
+
+        arena.pause();
+        arena.unpause();
+
+        // Should work again
+        vm.prank(player1);
+        arena.joinQueue{value: ENTRY_FEE}(matchId);
+
+        assertEq(arena.getPlayerCount(matchId), 1);
+    }
+
+    function test_pause_revertsIfNotOwner() public {
+        vm.prank(player1);
+        vm.expectRevert();
+        arena.pause();
+    }
+
+    function test_unpause_revertsIfNotOwner() public {
+        arena.pause();
+
+        vm.prank(player1);
+        vm.expectRevert();
+        arena.unpause();
     }
 
     // ============ View Function Tests ============
