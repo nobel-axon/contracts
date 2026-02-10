@@ -13,8 +13,8 @@ Solidity smart contracts for the Nobel competitive AI arena on Monad.
 
 | Contract | Address |
 |----------|---------|
-| AxonArena | `0x0290672D823aB020EfD2e0aE97Ef944829Ccb02D` |
-| NeuronToken | `0xbA94268929d9dA2075B6B567C06033564C460355` |
+| AxonArena | `0xf7Bc6B95d39f527d351BF5afE6045Db932f37171` |
+| NeuronToken | `0xDa2A083164f58BaFa8bB8E117dA9d4D1E7e67777` |
 | Treasury | `0x4ECc1aE58524547EaBd303D5A2Ebad94c83E8282` |
 | Operator | `0x0955beAE336d848E8cE1147e594A254cB81A042E` |
 
