@@ -10,119 +10,70 @@ import "./interfaces/IIdentityRegistry.sol";
 
 /**
  * @title BountyArena
- * @notice On-chain AI Agent Bounty Arena on Monad
- * @dev Bounty lifecycle: Open -> AnswerPeriod -> Settled/Expired/Refunded
+ * @notice Permissionless NEURON-based bounty arena on Monad
+ * @dev Bounty lifecycle: Active -> Settled (poster picks winner)
+ *      or Active -> Expired (deadline passes, proportional claim / refund)
  *
  * Economic model:
- * - Bounty creation: MON deposit as reward pool
+ * - Bounty creation: poster deposits NEURON via transferFrom
  * - Answers: $NEURON burn per attempt (doubles each attempt per bounty)
- * - Settlement: configurable split (default 85% winner, 10% treasury, 5% burn allocation)
- * - Rating gate: optional minimum ERC-8004 reputation to join bounty
+ * - Settlement: poster picks winner before deadline, winner claims full reward
+ * - Fallback: proportional split by reputation if deadline passes, or refund if no answers
  */
 contract BountyArena is Ownable, ReentrancyGuard, Pausable {
+    // ============ Constants ============
+
+    uint256 public constant MAX_ANSWER_ATTEMPTS = 20;
+    uint256 public constant MAX_ANSWER_LENGTH = 5000;
+
     // ============ Type Definitions ============
 
-    /**
-     * @notice Bounty lifecycle phases
-     * @dev Open: Accepting agents, waiting for joinDeadline
-     *      AnswerPeriod: Active answering, NEURON burned per attempt
-     *      Settled: Winner determined, prizes distributed
-     *      Expired: No agents joined by deadline
-     *      Refunded: Answer timeout with no winner, agents refunded NEURON cost? No — MON refund
-     */
     enum BountyPhase {
-        Open,
-        AnswerPeriod,
-        Settled,
-        Expired,
-        Refunded
+        Active,
+        Settled
     }
 
-    /**
-     * @notice Bounty configuration (set at creation, immutable during bounty)
-     */
     struct BountyConfig {
-        address creator;         // Address that created and funded the bounty
-        uint256 reward;          // Total MON reward pool
-        uint256 baseAnswerFee;   // Base NEURON burned per answer (doubles each attempt)
-        int128 minRating;        // Minimum ERC-8004 reputation score (0 = open bounty)
-        uint64 joinDeadline;     // When open phase times out
-        uint64 answerDuration;   // Duration of answer period in seconds
-        uint8 maxAgents;         // Maximum agents allowed
-        string question;         // Bounty question text
-        string category;         // Question category
-        uint8 difficulty;        // Difficulty level 1-5
+        address creator;
+        uint256 reward;          // NEURON deposited
+        uint256 baseAnswerFee;   // NEURON burn per answer (caller-provided at creation)
+        int128 minRating;        // ERC-8004 reputation gate (0 = open)
+        uint64 deadline;         // Single deadline for join + answer + pickWinner
+        uint8 maxAgents;
+        string question;
+        string category;
+        uint8 difficulty;        // 1-5
     }
 
-    /**
-     * @notice Bounty dynamic state (changes during bounty lifecycle)
-     */
     struct BountyState {
-        uint64 answerDeadline;   // When answer period ends (0 until answer period starts)
         BountyPhase phase;
         address winner;
-        uint256 agentCount;      // Number of agents that joined
+        uint256 agentCount;
+        uint256 answeringAgentCount;
+        int128 totalAnsweringReputation;  // sum of snapshotted reps of answering agents
+        bool rewardClaimed;               // true after winner/refund claim
     }
 
     // ============ Storage ============
 
-    /// @notice The $NEURON token contract for answer fee burns
     INeuronToken public immutable neuronToken;
-
-    /// @notice The ERC-8004 reputation registry
     IReputationRegistry public immutable reputationRegistry;
-
-    /// @notice The ERC-8004 identity registry
     IIdentityRegistry public immutable identityRegistry;
 
-    /// @notice Treasury address for protocol fees
-    address public treasury;
-
-    /// @notice Prize split in basis points (10000 = 100%)
-    uint16 public winnerBps;
-    uint16 public treasuryBps;
-    uint16 public burnBps;
-
-    /// @notice Minimum bounty reward in MON
-    uint256 public minBountyReward;
-
-    /// @notice Base answer fee for bounties (NEURON)
-    uint256 public defaultBaseAnswerFee;
-
-    /// @notice Authorized operators (can manage bounties)
-    mapping(address => bool) public operators;
-
-    /// @notice Counter for generating unique bounty IDs
     uint256 public nextBountyId;
 
-    /// @notice Bounty configuration by ID
     mapping(uint256 => BountyConfig) internal _bountyConfigs;
-
-    /// @notice Bounty state by ID
     mapping(uint256 => BountyState) public bountyStates;
 
-    /// @notice Agents in each bounty
-    /// @dev bountyId => array of agent addresses
     mapping(uint256 => address[]) public bountyAgents;
-
-    /// @notice Track if an address is in a specific bounty
-    /// @dev bountyId => agent => isInBounty
     mapping(uint256 => mapping(address => bool)) public isAgentInBounty;
 
-    /// @notice Number of answer attempts per agent per bounty
-    /// @dev bountyId => agent => attemptCount (used for doubling fee calculation)
     mapping(uint256 => mapping(address => uint256)) public answerAttempts;
-
-    /// @notice Total NEURON burned per bounty (for stats/events)
     mapping(uint256 => uint256) public bountyBurnTotal;
 
-    /// @notice Accumulated NEURON buyback allocation
-    /// @dev winner => accumulated MON for NEURON buyback
-    mapping(address => uint256) public burnAllocation;
-
-    /// @notice Pending refunds for pull-pattern withdrawal
-    /// @dev player => pending MON refund amount
-    mapping(address => uint256) public pendingRefunds;
+    mapping(uint256 => mapping(address => int128)) public agentReputation;
+    mapping(uint256 => mapping(address => bool)) public hasAnswered;
+    mapping(uint256 => mapping(address => bool)) public claimed;
 
     // ============ Events ============
 
@@ -130,11 +81,12 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         uint256 indexed bountyId,
         address indexed creator,
         uint256 reward,
+        uint256 baseAnswerFee,
         string question,
         string category,
         uint8 difficulty,
         int128 minRating,
-        uint64 joinDeadline,
+        uint64 deadline,
         uint8 maxAgents
     );
 
@@ -142,13 +94,8 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         uint256 indexed bountyId,
         address indexed agent,
         uint256 agentId,
-        uint256 agentCount
-    );
-
-    event BountyAnswerPeriodStarted(
-        uint256 indexed bountyId,
-        uint256 startTime,
-        uint256 deadline
+        uint256 agentCount,
+        int128 snapshotReputation
     );
 
     event BountyAnswerSubmitted(
@@ -159,80 +106,59 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         uint256 neuronBurned
     );
 
-    event BountySettled(
-        uint256 indexed bountyId,
-        address indexed winner,
-        uint256 winnerPrize,
-        uint256 treasuryFee,
-        uint256 burnAllocationAmount
-    );
-
-    event BountyExpired(uint256 indexed bountyId);
-
-    event BountyRefunded(
-        uint256 indexed bountyId,
-        uint256 agentCount,
-        uint256 refundPerAgent
-    );
-
     event BountyNeuronBurned(
         uint256 indexed bountyId,
         address indexed agent,
         uint256 amount
     );
 
-    event RefundCredited(
+    event BountySettled(
+        uint256 indexed bountyId,
+        address indexed winner,
+        uint256 reward
+    );
+
+    event WinnerRewardClaimed(
+        uint256 indexed bountyId,
+        address indexed winner,
+        uint256 amount
+    );
+
+    event ProportionalClaimed(
         uint256 indexed bountyId,
         address indexed agent,
         uint256 amount
     );
 
-    event RefundWithdrawn(
-        address indexed agent,
+    event RefundClaimed(
+        uint256 indexed bountyId,
+        address indexed creator,
         uint256 amount
     );
-
-    event BurnAllocationClaimed(
-        address indexed operator,
-        address indexed winner,
-        uint256 amount
-    );
-
-    event OperatorAdded(address indexed operator);
-    event OperatorRemoved(address indexed operator);
-    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
-    event SplitUpdated(uint16 winnerBps, uint16 treasuryBps, uint16 burnBps);
-    event MinBountyRewardUpdated(uint256 oldMinReward, uint256 newMinReward);
 
     // ============ Errors ============
 
-    error NotOperator();
     error BountyNotFound(uint256 bountyId);
     error InvalidPhase(BountyPhase expected, BountyPhase actual);
     error AlreadyInBounty(uint256 bountyId, address agent);
     error NotInBounty(uint256 bountyId, address agent);
     error BountyFull(uint256 bountyId);
-    error JoinDeadlinePassed(uint256 bountyId);
-    error JoinDeadlineNotPassed(uint256 bountyId);
-    error AnswerDeadlinePassed(uint256 bountyId);
-    error AnswerDeadlineNotPassed(uint256 bountyId);
     error InsufficientRating(int128 required, int128 actual);
-    error InsufficientReward(uint256 minRequired, uint256 provided);
     error CreatorCannotJoin(uint256 bountyId);
     error AgentNotRegistered(address agent);
-    error NoAgentsJoined(uint256 bountyId);
     error ZeroAddress();
-    error NoBurnAllocation();
-    error NoPendingRefund();
     error InvalidParameters();
-    error InvalidSplit();
+    error DeadlinePassed(uint256 bountyId);
+    error DeadlineNotPassed(uint256 bountyId);
+    error NotCreator(uint256 bountyId);
+    error NotWinner(uint256 bountyId);
+    error NotSettled(uint256 bountyId);
+    error AgentNotAnswered(uint256 bountyId, address agent);
+    error AgentsAnswered(uint256 bountyId);
+    error AlreadyClaimed(uint256 bountyId, address agent);
+    error NoAgentsAnswered(uint256 bountyId);
 
     // ============ Modifiers ============
-
-    modifier onlyOperator() {
-        if (!operators[msg.sender]) revert NotOperator();
-        _;
-    }
 
     modifier bountyExists(uint256 bountyId) {
         if (bountyId == 0 || bountyId >= nextBountyId) revert BountyNotFound(bountyId);
@@ -247,87 +173,22 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
 
     // ============ Constructor ============
 
-    /**
-     * @notice Deploy the BountyArena contract
-     * @param _neuronToken Address of the $NEURON token contract
-     * @param _reputationRegistry Address of the ERC-8004 reputation registry
-     * @param _identityRegistry Address of the ERC-8004 identity registry
-     * @param _treasury Address to receive protocol fees
-     * @param _initialOperator Initial operator address (Agent Chief)
-     */
     constructor(
         address _neuronToken,
         address _reputationRegistry,
-        address _identityRegistry,
-        address _treasury,
-        address _initialOperator
+        address _identityRegistry
     ) Ownable(msg.sender) {
         if (_neuronToken == address(0)) revert ZeroAddress();
         if (_reputationRegistry == address(0)) revert ZeroAddress();
         if (_identityRegistry == address(0)) revert ZeroAddress();
-        if (_treasury == address(0)) revert ZeroAddress();
-        if (_initialOperator == address(0)) revert ZeroAddress();
 
         neuronToken = INeuronToken(_neuronToken);
         reputationRegistry = IReputationRegistry(_reputationRegistry);
         identityRegistry = IIdentityRegistry(_identityRegistry);
-        treasury = _treasury;
-        operators[_initialOperator] = true;
-        nextBountyId = 1; // Start from 1, 0 reserved for "no bounty"
-
-        // Default split: 85% winner, 10% treasury, 5% burn allocation
-        winnerBps = 8500;
-        treasuryBps = 1000;
-        burnBps = 500;
-
-        // Default minimum bounty reward: 0.01 MON
-        minBountyReward = 0.01 ether;
-
-        // Default base answer fee: 0.1 NEURON
-        defaultBaseAnswerFee = 0.1 ether;
-
-        emit OperatorAdded(_initialOperator);
+        nextBountyId = 1;
     }
 
     // ============ Admin Functions ============
-
-    function addOperator(address _operator) external onlyOwner {
-        if (_operator == address(0)) revert ZeroAddress();
-        if (operators[_operator]) revert InvalidParameters();
-        operators[_operator] = true;
-        emit OperatorAdded(_operator);
-    }
-
-    function removeOperator(address _operator) external onlyOwner {
-        if (!operators[_operator]) revert InvalidParameters();
-        operators[_operator] = false;
-        emit OperatorRemoved(_operator);
-    }
-
-    function isOperator(address _operator) external view returns (bool) {
-        return operators[_operator];
-    }
-
-    function setTreasury(address _treasury) external onlyOwner {
-        if (_treasury == address(0)) revert ZeroAddress();
-        address oldTreasury = treasury;
-        treasury = _treasury;
-        emit TreasuryUpdated(oldTreasury, _treasury);
-    }
-
-    function setSplit(uint16 _winnerBps, uint16 _treasuryBps, uint16 _burnBps) external onlyOwner {
-        if (uint256(_winnerBps) + uint256(_treasuryBps) + uint256(_burnBps) != 10000) revert InvalidSplit();
-        winnerBps = _winnerBps;
-        treasuryBps = _treasuryBps;
-        burnBps = _burnBps;
-        emit SplitUpdated(_winnerBps, _treasuryBps, _burnBps);
-    }
-
-    function setMinBountyReward(uint256 _minReward) external onlyOwner {
-        uint256 oldMinReward = minBountyReward;
-        minBountyReward = _minReward;
-        emit MinBountyRewardUpdated(oldMinReward, _minReward);
-    }
 
     function pause() external onlyOwner {
         _pause();
@@ -339,65 +200,77 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
 
     // ============ View Functions ============
 
-    function getBountyConfig(uint256 bountyId) external view returns (BountyConfig memory) {
+    function getBountyConfig(uint256 bountyId) external view bountyExists(bountyId) returns (BountyConfig memory) {
         return _bountyConfigs[bountyId];
     }
 
-    function getBountyState(uint256 bountyId) external view returns (BountyState memory) {
+    function getBountyState(uint256 bountyId) external view bountyExists(bountyId) returns (BountyState memory) {
         return bountyStates[bountyId];
     }
 
-    function getBountyAgents(uint256 bountyId) external view returns (address[] memory) {
+    function getBountyAgents(uint256 bountyId) external view bountyExists(bountyId) returns (address[] memory) {
         return bountyAgents[bountyId];
     }
 
-    function getAgentCount(uint256 bountyId) external view returns (uint256) {
+    function getAgentCount(uint256 bountyId) external view bountyExists(bountyId) returns (uint256) {
         return bountyAgents[bountyId].length;
     }
 
-    function getCurrentAnswerFee(uint256 bountyId, address agent) public view returns (uint256) {
+    function getCurrentAnswerFee(uint256 bountyId, address agent) public view bountyExists(bountyId) returns (uint256) {
         uint256 attempts = answerAttempts[bountyId][agent];
+        if (attempts >= MAX_ANSWER_ATTEMPTS) revert InvalidParameters();
         return _bountyConfigs[bountyId].baseAnswerFee * (2 ** attempts);
+    }
+
+    function getClaimableAmount(uint256 bountyId, address agent) external view bountyExists(bountyId) returns (uint256) {
+        BountyConfig storage config = _bountyConfigs[bountyId];
+        BountyState storage state = bountyStates[bountyId];
+
+        if (state.phase != BountyPhase.Active) return 0;
+        if (block.timestamp <= config.deadline) return 0;
+        if (!hasAnswered[bountyId][agent]) return 0;
+        if (claimed[bountyId][agent]) return 0;
+        if (state.answeringAgentCount == 0) return 0;
+
+        if (state.totalAnsweringReputation <= 0) {
+            return config.reward / state.answeringAgentCount;
+        }
+
+        int128 agentRep = agentReputation[bountyId][agent];
+        if (agentRep <= 0) return 0;
+
+        return (config.reward * uint256(uint128(agentRep))) / uint256(uint128(state.totalAnsweringReputation));
     }
 
     // ============ Bounty Creation ============
 
-    /**
-     * @notice Create a new bounty with MON reward
-     * @param question The bounty question text
-     * @param minRating Minimum ERC-8004 reputation score (0 = open bounty)
-     * @param category Question category
-     * @param difficulty Difficulty level 1-5
-     * @param joinDuration Duration of open phase in seconds
-     * @param answerDuration Duration of answer period in seconds
-     * @param maxAgents Maximum agents allowed
-     * @return bountyId The newly created bounty ID
-     */
     function createBounty(
         string calldata question,
         int128 minRating,
         string calldata category,
         uint8 difficulty,
-        uint64 joinDuration,
-        uint64 answerDuration,
-        uint8 maxAgents
-    ) external payable whenNotPaused nonReentrant returns (uint256 bountyId) {
-        if (msg.value < minBountyReward) revert InsufficientReward(minBountyReward, msg.value);
+        uint64 duration,
+        uint8 maxAgents,
+        uint256 reward,
+        uint256 baseAnswerFee
+    ) external whenNotPaused nonReentrant returns (uint256 bountyId) {
+        if (reward == 0) revert InvalidParameters();
+        if (baseAnswerFee == 0) revert InvalidParameters();
         if (bytes(question).length == 0) revert InvalidParameters();
         if (difficulty == 0 || difficulty > 5) revert InvalidParameters();
-        if (joinDuration == 0) revert InvalidParameters();
-        if (answerDuration == 0) revert InvalidParameters();
+        if (duration == 0) revert InvalidParameters();
         if (maxAgents == 0) revert InvalidParameters();
+
+        neuronToken.transferFrom(msg.sender, address(this), reward);
 
         bountyId = nextBountyId++;
 
         _bountyConfigs[bountyId] = BountyConfig({
             creator: msg.sender,
-            reward: msg.value,
-            baseAnswerFee: defaultBaseAnswerFee,
+            reward: reward,
+            baseAnswerFee: baseAnswerFee,
             minRating: minRating,
-            joinDeadline: uint64(block.timestamp) + joinDuration,
-            answerDuration: answerDuration,
+            deadline: uint64(block.timestamp) + duration,
             maxAgents: maxAgents,
             question: question,
             category: category,
@@ -405,132 +278,101 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         });
 
         bountyStates[bountyId] = BountyState({
-            answerDeadline: 0,
-            phase: BountyPhase.Open,
+            phase: BountyPhase.Active,
             winner: address(0),
-            agentCount: 0
+            agentCount: 0,
+            answeringAgentCount: 0,
+            totalAnsweringReputation: 0,
+            rewardClaimed: false
         });
 
         emit BountyCreated(
             bountyId,
             msg.sender,
-            msg.value,
+            reward,
+            baseAnswerFee,
             question,
             category,
             difficulty,
             minRating,
-            _bountyConfigs[bountyId].joinDeadline,
+            _bountyConfigs[bountyId].deadline,
             maxAgents
         );
     }
 
     // ============ Join Functions ============
 
-    /**
-     * @notice Join a bounty (checks ERC-8004 rating gate)
-     * @param bountyId The bounty to join
-     * @param agentId The ERC-8004 agent ID of the caller
-     */
     function joinBounty(uint256 bountyId, uint256 agentId)
         external
         whenNotPaused
         bountyExists(bountyId)
-        onlyPhase(bountyId, BountyPhase.Open)
+        onlyPhase(bountyId, BountyPhase.Active)
         nonReentrant
     {
         BountyConfig storage config = _bountyConfigs[bountyId];
         BountyState storage state = bountyStates[bountyId];
 
-        // Check join deadline
-        if (block.timestamp > config.joinDeadline) revert JoinDeadlinePassed(bountyId);
-
-        // Creator cannot join own bounty
+        if (block.timestamp > config.deadline) revert DeadlinePassed(bountyId);
         if (msg.sender == config.creator) revert CreatorCannotJoin(bountyId);
-
-        // Check if already in bounty
         if (isAgentInBounty[bountyId][msg.sender]) revert AlreadyInBounty(bountyId, msg.sender);
-
-        // Check if bounty is full
         if (bountyAgents[bountyId].length >= config.maxAgents) revert BountyFull(bountyId);
-
-        // Verify agent identity: ownerOf reverts or returns zero for unregistered IDs
         if (identityRegistry.ownerOf(agentId) != msg.sender) revert AgentNotRegistered(msg.sender);
 
-        // Check rating gate (if minRating > 0)
+        // Always snapshot reputation
+        address[] memory emptyClients = new address[](0);
+        (, int128 summaryValue,) =
+            reputationRegistry.getSummary(agentId, emptyClients, "", "");
+        agentReputation[bountyId][msg.sender] = summaryValue;
+
+        // Rating gate check if minRating > 0
         if (config.minRating > 0) {
-            address[] memory emptyClients = new address[](0);
-            (, int128 summaryValue,) =
-                reputationRegistry.getSummary(agentId, emptyClients, "", "");
             if (summaryValue < config.minRating) {
                 revert InsufficientRating(config.minRating, summaryValue);
             }
         }
 
-        // Add agent to bounty
         bountyAgents[bountyId].push(msg.sender);
         isAgentInBounty[bountyId][msg.sender] = true;
         state.agentCount++;
 
-        emit AgentJoinedBounty(bountyId, msg.sender, agentId, state.agentCount);
-    }
-
-    // ============ Answer Period Functions ============
-
-    /**
-     * @notice Start the answer period for a bounty
-     * @param bountyId The bounty ID
-     * @dev Operator-only. At least one agent must have joined.
-     */
-    function startBountyAnswerPeriod(uint256 bountyId)
-        external
-        onlyOperator
-        bountyExists(bountyId)
-        onlyPhase(bountyId, BountyPhase.Open)
-    {
-        BountyConfig storage config = _bountyConfigs[bountyId];
-        BountyState storage state = bountyStates[bountyId];
-
-        if (state.agentCount == 0) revert NoAgentsJoined(bountyId);
-
-        uint64 startTime = uint64(block.timestamp);
-        state.answerDeadline = startTime + config.answerDuration;
-        state.phase = BountyPhase.AnswerPeriod;
-
-        emit BountyAnswerPeriodStarted(bountyId, startTime, state.answerDeadline);
+        emit AgentJoinedBounty(bountyId, msg.sender, agentId, state.agentCount, summaryValue);
     }
 
     // ============ Answer Functions ============
 
-    /**
-     * @notice Submit a bounty answer attempt (burns NEURON, fee doubles each attempt)
-     * @param bountyId The bounty ID
-     * @param answer The submitted answer
-     */
     function submitBountyAnswer(uint256 bountyId, string calldata answer)
         external
         whenNotPaused
         bountyExists(bountyId)
-        onlyPhase(bountyId, BountyPhase.AnswerPeriod)
+        onlyPhase(bountyId, BountyPhase.Active)
         nonReentrant
     {
+        BountyConfig storage config = _bountyConfigs[bountyId];
         BountyState storage state = bountyStates[bountyId];
 
-        // Check answer deadline
-        if (block.timestamp > state.answerDeadline) revert AnswerDeadlinePassed(bountyId);
-
-        // Check if agent is in bounty
+        if (block.timestamp > config.deadline) revert DeadlinePassed(bountyId);
+        if (bytes(answer).length == 0 || bytes(answer).length > MAX_ANSWER_LENGTH) revert InvalidParameters();
         if (!isAgentInBounty[bountyId][msg.sender]) revert NotInBounty(bountyId, msg.sender);
 
-        // Calculate burn amount (doubles each attempt)
         uint256 attempts = answerAttempts[bountyId][msg.sender];
-        uint256 burnAmount = _bountyConfigs[bountyId].baseAnswerFee * (2 ** attempts);
+        if (attempts >= MAX_ANSWER_ATTEMPTS) revert InvalidParameters();
+        uint256 burnAmount = config.baseAnswerFee * (2 ** attempts);
 
-        // Burn NEURON from sender (requires approval)
         neuronToken.burnFrom(msg.sender, burnAmount);
 
-        // Update tracking
         answerAttempts[bountyId][msg.sender] = attempts + 1;
         bountyBurnTotal[bountyId] += burnAmount;
+
+        // Track first answer — only accumulate positive reputation into
+        // totalAnsweringReputation so proportional shares always sum to ≤ reward.
+        if (!hasAnswered[bountyId][msg.sender]) {
+            hasAnswered[bountyId][msg.sender] = true;
+            state.answeringAgentCount++;
+            int128 rep = agentReputation[bountyId][msg.sender];
+            if (rep > 0) {
+                state.totalAnsweringReputation += rep;
+            }
+        }
 
         emit BountyNeuronBurned(bountyId, msg.sender, burnAmount);
         emit BountyAnswerSubmitted(bountyId, msg.sender, answer, attempts + 1, burnAmount);
@@ -538,151 +380,95 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
 
     // ============ Settlement Functions ============
 
-    /**
-     * @notice Settle bounty with a winner
-     * @param bountyId The bounty ID
-     * @param winner The winning agent address
-     * @dev Distribution: 85% winner / 10% treasury / 5% burn allocation (configurable)
-     */
-    function settleBounty(uint256 bountyId, address winner)
+    function pickWinner(uint256 bountyId, address winner)
         external
-        onlyOperator
         bountyExists(bountyId)
-        onlyPhase(bountyId, BountyPhase.AnswerPeriod)
+        onlyPhase(bountyId, BountyPhase.Active)
         nonReentrant
     {
-        if (winner == address(0)) revert ZeroAddress();
-        if (!isAgentInBounty[bountyId][winner]) revert NotInBounty(bountyId, winner);
-
         BountyConfig storage config = _bountyConfigs[bountyId];
         BountyState storage state = bountyStates[bountyId];
-        uint256 pool = config.reward;
 
-        // Calculate distribution
-        uint256 winnerPrize = (pool * winnerBps) / 10000;
-        uint256 treasuryFee = (pool * treasuryBps) / 10000;
-        uint256 burnAllocationAmount = pool - winnerPrize - treasuryFee;
+        if (msg.sender != config.creator) revert NotCreator(bountyId);
+        if (block.timestamp > config.deadline) revert DeadlinePassed(bountyId);
+        if (!hasAnswered[bountyId][winner]) revert AgentNotAnswered(bountyId, winner);
 
-        // Update state
         state.winner = winner;
         state.phase = BountyPhase.Settled;
-        burnAllocation[winner] += burnAllocationAmount;
 
-        // Transfer winner prize
-        (bool winnerSuccess,) = payable(winner).call{value: winnerPrize}("");
-        require(winnerSuccess, "Winner transfer failed");
-
-        // Transfer treasury fee
-        (bool treasurySuccess,) = payable(treasury).call{value: treasuryFee}("");
-        require(treasurySuccess, "Treasury transfer failed");
-
-        emit BountySettled(bountyId, winner, winnerPrize, treasuryFee, burnAllocationAmount);
+        emit BountySettled(bountyId, winner, config.reward);
     }
 
-    // ============ Expiry Functions ============
-
-    /**
-     * @notice Expire a bounty that has no agents joined after deadline
-     * @param bountyId The bounty ID
-     * @dev Refunds the full reward to the creator via pull pattern
-     */
-    function expireBounty(uint256 bountyId)
+    function claimWinnerReward(uint256 bountyId)
         external
-        onlyOperator
         bountyExists(bountyId)
-        onlyPhase(bountyId, BountyPhase.Open)
-        nonReentrant
-    {
-        BountyConfig storage config = _bountyConfigs[bountyId];
-        BountyState storage state = bountyStates[bountyId];
-
-        // Join deadline must have passed
-        if (block.timestamp <= config.joinDeadline) revert JoinDeadlineNotPassed(bountyId);
-
-        // No agents joined
-        if (state.agentCount > 0) revert InvalidParameters();
-
-        // Update state
-        state.phase = BountyPhase.Expired;
-
-        // Refund creator via pull pattern
-        pendingRefunds[config.creator] += config.reward;
-
-        emit RefundCredited(bountyId, config.creator, config.reward);
-        emit BountyExpired(bountyId);
-    }
-
-    // ============ Refund Functions ============
-
-    /**
-     * @notice Refund bounty after answer period timeout with no winner
-     * @param bountyId The bounty ID
-     * @dev Creator gets reward back (minus treasury fee) via pull pattern
-     */
-    function refundBounty(uint256 bountyId)
-        external
-        onlyOperator
-        bountyExists(bountyId)
-        onlyPhase(bountyId, BountyPhase.AnswerPeriod)
+        onlyPhase(bountyId, BountyPhase.Settled)
         nonReentrant
     {
         BountyState storage state = bountyStates[bountyId];
         BountyConfig storage config = _bountyConfigs[bountyId];
 
-        // Check that answer deadline has passed
-        if (block.timestamp <= state.answerDeadline) revert AnswerDeadlineNotPassed(bountyId);
+        if (msg.sender != state.winner) revert NotWinner(bountyId);
+        if (state.rewardClaimed) revert AlreadyClaimed(bountyId, msg.sender);
 
-        uint256 pool = config.reward;
+        state.rewardClaimed = true;
+        neuronToken.transfer(msg.sender, config.reward);
 
-        // Calculate distribution using configurable treasury rate
-        uint256 treasuryFee = (pool * treasuryBps) / 10000;
-        uint256 refundPool = pool - treasuryFee;
+        emit WinnerRewardClaimed(bountyId, msg.sender, config.reward);
+    }
 
-        // Update state
-        state.phase = BountyPhase.Refunded;
+    function claimProportional(uint256 bountyId)
+        external
+        bountyExists(bountyId)
+        onlyPhase(bountyId, BountyPhase.Active)
+        nonReentrant
+    {
+        BountyConfig storage config = _bountyConfigs[bountyId];
+        BountyState storage state = bountyStates[bountyId];
 
-        // Transfer treasury fee
-        if (treasuryFee > 0) {
-            (bool treasurySuccess,) = payable(treasury).call{value: treasuryFee}("");
-            require(treasurySuccess, "Treasury transfer failed");
+        if (block.timestamp <= config.deadline) revert DeadlineNotPassed(bountyId);
+        if (!hasAnswered[bountyId][msg.sender]) revert AgentNotAnswered(bountyId, msg.sender);
+        if (claimed[bountyId][msg.sender]) revert AlreadyClaimed(bountyId, msg.sender);
+        if (state.answeringAgentCount == 0) revert NoAgentsAnswered(bountyId);
+
+        uint256 share;
+        if (state.totalAnsweringReputation <= 0) {
+            share = config.reward / state.answeringAgentCount;
+        } else {
+            int128 agentRep = agentReputation[bountyId][msg.sender];
+            if (agentRep <= 0) {
+                share = 0;
+            } else {
+                share = (config.reward * uint256(uint128(agentRep))) / uint256(uint128(state.totalAnsweringReputation));
+            }
         }
 
-        // Refund creator via pull pattern
-        pendingRefunds[config.creator] += refundPool;
+        claimed[bountyId][msg.sender] = true;
 
-        emit RefundCredited(bountyId, config.creator, refundPool);
-        emit BountyRefunded(bountyId, state.agentCount, refundPool);
+        if (share > 0) {
+            neuronToken.transfer(msg.sender, share);
+        }
+
+        emit ProportionalClaimed(bountyId, msg.sender, share);
     }
 
-    /**
-     * @notice Withdraw pending refunds
-     * @dev Pull pattern - users call this to withdraw their refunds
-     */
-    function withdrawRefund() external nonReentrant {
-        uint256 amount = pendingRefunds[msg.sender];
-        if (amount == 0) revert NoPendingRefund();
+    function claimRefund(uint256 bountyId)
+        external
+        bountyExists(bountyId)
+        onlyPhase(bountyId, BountyPhase.Active)
+        nonReentrant
+    {
+        BountyConfig storage config = _bountyConfigs[bountyId];
+        BountyState storage state = bountyStates[bountyId];
 
-        pendingRefunds[msg.sender] = 0;
+        if (msg.sender != config.creator) revert NotCreator(bountyId);
+        if (block.timestamp <= config.deadline) revert DeadlineNotPassed(bountyId);
+        if (state.answeringAgentCount != 0) revert AgentsAnswered(bountyId);
+        if (state.rewardClaimed) revert AlreadyClaimed(bountyId, msg.sender);
 
-        (bool success,) = payable(msg.sender).call{value: amount}("");
-        require(success, "Refund withdrawal failed");
+        state.rewardClaimed = true;
+        neuronToken.transfer(msg.sender, config.reward);
 
-        emit RefundWithdrawn(msg.sender, amount);
-    }
-
-    /**
-     * @notice Claim burn allocation on behalf of a winner for NEURON buyback swap
-     * @param winner The winner whose allocation to claim
-     */
-    function claimBurnAllocationFor(address winner) external onlyOperator nonReentrant {
-        uint256 amount = burnAllocation[winner];
-        if (amount == 0) revert NoBurnAllocation();
-
-        burnAllocation[winner] = 0;
-
-        (bool success,) = payable(msg.sender).call{value: amount}("");
-        require(success, "Claim failed");
-
-        emit BurnAllocationClaimed(msg.sender, winner, amount);
+        emit RefundClaimed(bountyId, msg.sender, config.reward);
     }
 }

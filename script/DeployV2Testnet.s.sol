@@ -37,8 +37,6 @@ contract DeployV2Testnet is Script {
         address neuronToken = vm.envAddress("NEURON_TOKEN_ADDRESS");
         address reputationRegistry = vm.envAddress("REPUTATION_REGISTRY_ADDRESS");
         address identityRegistry = vm.envAddress("IDENTITY_REGISTRY_ADDRESS");
-        address treasury = vm.envAddress("TREASURY_ADDRESS");
-        address operator = vm.envAddress("OPERATOR_ADDRESS");
 
         console.log("");
         console.log("=== V2 Testnet Deployment ===");
@@ -47,8 +45,6 @@ contract DeployV2Testnet is Script {
         console.log("NEURON Token:", neuronToken);
         console.log("Reputation Registry:", reputationRegistry);
         console.log("Identity Registry:", identityRegistry);
-        console.log("Treasury:", treasury);
-        console.log("Operator:", operator);
         console.log("");
 
         // ============ Deploy ============
@@ -57,9 +53,7 @@ contract DeployV2Testnet is Script {
         BountyArena bountyArena = new BountyArena(
             neuronToken,
             reputationRegistry,
-            identityRegistry,
-            treasury,
-            operator
+            identityRegistry
         );
 
         vm.stopBroadcast();

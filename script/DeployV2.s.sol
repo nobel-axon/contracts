@@ -38,8 +38,6 @@ contract DeployV2 is Script {
         address neuronToken;
         address reputationRegistry;
         address identityRegistry;
-        address treasury;
-        address operator;
         uint256 deployerBalance;
     }
 
@@ -75,8 +73,6 @@ contract DeployV2 is Script {
         require(config.neuronToken != address(0), "SAFETY: NEURON_TOKEN_ADDRESS not set");
         require(config.reputationRegistry != address(0), "SAFETY: REPUTATION_REGISTRY_ADDRESS not set");
         require(config.identityRegistry != address(0), "SAFETY: IDENTITY_REGISTRY_ADDRESS not set");
-        require(config.treasury != address(0), "SAFETY: TREASURY_ADDRESS not set");
-        require(config.operator != address(0), "SAFETY: OPERATOR_ADDRESS not set");
 
         // ============ Safety Check 4: Verify Contracts Exist ============
         _verifyContractExists(config.neuronToken, "NEURON Token");
@@ -107,9 +103,7 @@ contract DeployV2 is Script {
         BountyArena bountyArena = new BountyArena(
             config.neuronToken,
             config.reputationRegistry,
-            config.identityRegistry,
-            config.treasury,
-            config.operator
+            config.identityRegistry
         );
 
         vm.stopBroadcast();
@@ -127,8 +121,6 @@ contract DeployV2 is Script {
         config.neuronToken = vm.envAddress("NEURON_TOKEN_ADDRESS");
         config.reputationRegistry = vm.envAddress("REPUTATION_REGISTRY_ADDRESS");
         config.identityRegistry = vm.envAddress("IDENTITY_REGISTRY_ADDRESS");
-        config.treasury = vm.envAddress("TREASURY_ADDRESS");
-        config.operator = vm.envAddress("OPERATOR_ADDRESS");
         config.deployerBalance = config.deployer.balance;
     }
 
@@ -166,20 +158,11 @@ contract DeployV2 is Script {
         require(address(ba.identityRegistry()) == config.identityRegistry, "FATAL: Identity registry mismatch");
         console.log("[OK] Identity registry address correct");
 
-        require(ba.treasury() == config.treasury, "FATAL: Treasury address mismatch");
-        console.log("[OK] Treasury address correct");
-
-        require(ba.operators(config.operator), "FATAL: Operator not set correctly");
-        console.log("[OK] Operator address correct");
-
         require(ba.owner() == config.deployer, "FATAL: Owner not set correctly");
         console.log("[OK] Owner address correct");
 
-        // Verify split
-        require(ba.winnerBps() == 8500, "FATAL: Winner BPS mismatch");
-        require(ba.treasuryBps() == 1000, "FATAL: Treasury BPS mismatch");
-        require(ba.burnBps() == 500, "FATAL: Burn BPS mismatch");
-        console.log("[OK] Default split correct (85/10/5)");
+        require(ba.nextBountyId() == 1, "FATAL: nextBountyId not initialized");
+        console.log("[OK] nextBountyId initialized to 1");
 
         console.log("");
         console.log("All post-deployment checks passed!");
@@ -196,8 +179,6 @@ contract DeployV2 is Script {
         console.log("NEURON Token:", config.neuronToken);
         console.log("Reputation Registry:", config.reputationRegistry);
         console.log("Identity Registry:", config.identityRegistry);
-        console.log("Treasury:", config.treasury);
-        console.log("Initial Operator:", config.operator);
         console.log("");
     }
 
@@ -213,15 +194,12 @@ contract DeployV2 is Script {
         console.log("BOUNTY_ARENA_ADDRESS=", bountyArena);
         console.log("");
         console.log("=== Roles ===");
-        console.log("Owner (can add/remove operators):", config.deployer);
-        console.log("Operator (can manage bounties):", config.operator);
-        console.log("Treasury (receives 10% fees):", config.treasury);
+        console.log("Owner (can pause/unpause):", config.deployer);
         console.log("");
         console.log("=== Next Steps ===");
         console.log("1. Verify contract on explorer (if --verify failed)");
         console.log("2. Update all service configs with new address");
-        console.log("3. Add additional operators if needed");
-        console.log("4. Test with a small bounty before full launch");
+        console.log("3. Test with a small bounty before full launch");
         console.log("");
     }
 }
