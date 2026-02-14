@@ -73,6 +73,7 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
     IIdentityRegistry public immutable identityRegistry;
 
     uint256 public nextBountyId;
+    address public reputationClient;  // Address used as clientAddress filter in getSummary calls
 
     mapping(uint256 => BountyConfig) internal _bountyConfigs;
     mapping(uint256 => BountyState) public bountyStates;
@@ -203,9 +204,16 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         reputationRegistry = IReputationRegistry(_reputationRegistry);
         identityRegistry = IIdentityRegistry(_identityRegistry);
         nextBountyId = 1;
+        reputationClient = address(this); // Default: self (avoids empty array revert)
     }
 
     // ============ Admin Functions ============
+
+    /// @notice Set the client address used for reputation lookups via getSummary.
+    function setReputationClient(address _client) external onlyOwner {
+        require(_client != address(0), "zero address");
+        reputationClient = _client;
+    }
 
     function pause() external onlyOwner {
         _pause();
@@ -373,9 +381,10 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         if (identityRegistry.ownerOf(agentId) != msg.sender) revert AgentNotRegistered(msg.sender);
 
         // Always snapshot reputation
-        address[] memory emptyClients = new address[](0);
+        address[] memory clients = new address[](1);
+        clients[0] = reputationClient;
         (, int128 summaryValue,) =
-            reputationRegistry.getSummary(agentId, emptyClients, "", "");
+            reputationRegistry.getSummary(agentId, clients, "", "");
         agentReputation[bountyId][msg.sender] = summaryValue;
 
         // Rating gate check if minRating > 0

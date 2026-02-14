@@ -110,6 +110,7 @@ contract DeployV2 is Script {
         // Add operator if configured
         if (config.operatorAddress != address(0)) {
             bountyArena.addOperator(config.operatorAddress);
+            bountyArena.setReputationClient(config.operatorAddress);
             console.log("Operator added:", config.operatorAddress);
         }
 
