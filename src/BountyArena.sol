@@ -11,11 +11,13 @@ import "./interfaces/IIdentityRegistry.sol";
 /**
  * @title BountyArena
  * @notice Permissionless NEURON-based bounty arena on Monad
- * @dev Bounty lifecycle: Active -> Settled (poster picks winner)
+ * @dev Bounty lifecycle: Pending -> Active -> Settled (poster picks winner)
  *      or Active -> Expired (deadline passes, proportional claim / refund)
+ *      or Pending -> Settled (rejected by operator, creator refunded)
  *
  * Economic model:
- * - Bounty creation: poster deposits NEURON via transferFrom
+ * - Bounty creation: poster deposits NEURON via transferFrom (starts Pending)
+ * - Operator screening: operator approves (Pending -> Active) or rejects (refund)
  * - Answers: $NEURON burn per attempt (doubles each attempt per bounty)
  * - Settlement: poster picks winner before deadline, winner claims full reward
  * - Fallback: proportional split by reputation if deadline passes, or refund if no answers
@@ -26,9 +28,19 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
     uint256 public constant MAX_ANSWER_ATTEMPTS = 20;
     uint256 public constant MAX_ANSWER_LENGTH = 5000;
 
+    // ============ Operator Management ============
+
+    mapping(address => bool) public operators;
+
+    modifier onlyOperator() {
+        require(operators[msg.sender] || msg.sender == owner(), "not operator");
+        _;
+    }
+
     // ============ Type Definitions ============
 
     enum BountyPhase {
+        Pending,
         Active,
         Settled
     }
@@ -136,6 +148,11 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         uint256 amount
     );
 
+    event BountyApproved(uint256 indexed bountyId);
+    event BountyRejected(uint256 indexed bountyId, string reason);
+    event OperatorAdded(address indexed operator);
+    event OperatorRemoved(address indexed operator);
+
     // ============ Errors ============
 
     error BountyNotFound(uint256 bountyId);
@@ -196,6 +213,17 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    function addOperator(address _operator) external onlyOwner {
+        require(_operator != address(0), "zero address");
+        operators[_operator] = true;
+        emit OperatorAdded(_operator);
+    }
+
+    function removeOperator(address _operator) external onlyOwner {
+        operators[_operator] = false;
+        emit OperatorRemoved(_operator);
     }
 
     // ============ View Functions ============
@@ -278,7 +306,7 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
         });
 
         bountyStates[bountyId] = BountyState({
-            phase: BountyPhase.Active,
+            phase: BountyPhase.Pending,
             winner: address(0),
             agentCount: 0,
             answeringAgentCount: 0,
@@ -298,6 +326,32 @@ contract BountyArena is Ownable, ReentrancyGuard, Pausable {
             _bountyConfigs[bountyId].deadline,
             maxAgents
         );
+    }
+
+    // ============ Operator Screening ============
+
+    function approveBounty(uint256 bountyId)
+        external
+        onlyOperator
+        bountyExists(bountyId)
+        onlyPhase(bountyId, BountyPhase.Pending)
+    {
+        bountyStates[bountyId].phase = BountyPhase.Active;
+        emit BountyApproved(bountyId);
+    }
+
+    function rejectBounty(uint256 bountyId, string calldata reason)
+        external
+        onlyOperator
+        bountyExists(bountyId)
+        onlyPhase(bountyId, BountyPhase.Pending)
+        nonReentrant
+    {
+        BountyConfig storage config = _bountyConfigs[bountyId];
+        bountyStates[bountyId].phase = BountyPhase.Settled;
+        bountyStates[bountyId].rewardClaimed = true;
+        neuronToken.transfer(config.creator, config.reward);
+        emit BountyRejected(bountyId, reason);
     }
 
     // ============ Join Functions ============

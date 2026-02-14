@@ -88,6 +88,11 @@ contract BountyArenaTest is Test {
         uint256 amount
     );
 
+    event BountyApproved(uint256 indexed bountyId);
+    event BountyRejected(uint256 indexed bountyId, string reason);
+    event OperatorAdded(address indexed operator);
+    event OperatorRemoved(address indexed operator);
+
     function setUp() public {
         owner = address(this);
         creator = makeAddr("creator");
@@ -107,6 +112,9 @@ contract BountyArenaTest is Test {
             address(reputation),
             address(identity)
         );
+
+        // Add test contract as operator (owner = address(this))
+        arena.addOperator(address(this));
 
         // Fund creator with NEURON + approve arena (for reward deposit)
         neuron.mint(creator, 1000 ether);
@@ -164,6 +172,21 @@ contract BountyArenaTest is Test {
             BOUNTY_REWARD,
             BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
+    }
+
+    function _createPendingBounty() internal returns (uint256 bountyId) {
+        vm.prank(creator);
+        bountyId = arena.createBounty(
+            DEFAULT_QUESTION,
+            NO_RATING_GATE,
+            DEFAULT_CATEGORY,
+            DEFAULT_DIFFICULTY,
+            DURATION,
+            MAX_AGENTS,
+            BOUNTY_REWARD,
+            BASE_ANSWER_FEE
+        );
     }
 
     function _createRatedBounty(int128 minRating) internal returns (uint256 bountyId) {
@@ -178,6 +201,7 @@ contract BountyArenaTest is Test {
             BOUNTY_REWARD,
             BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
     }
 
     function _joinBounty(address agent, uint256 agentId, uint256 bountyId) internal {
@@ -214,6 +238,118 @@ contract BountyArenaTest is Test {
 
         vm.expectRevert(BountyArena.ZeroAddress.selector);
         new BountyArena(address(neuron), address(reputation), address(0));
+    }
+
+    // ============ Operator Tests ============
+
+    function test_addOperator_success() public {
+        address op = makeAddr("operator");
+        vm.expectEmit(true, false, false, true);
+        emit OperatorAdded(op);
+        arena.addOperator(op);
+        assertTrue(arena.operators(op));
+    }
+
+    function test_removeOperator_success() public {
+        address op = makeAddr("operator");
+        arena.addOperator(op);
+        vm.expectEmit(true, false, false, true);
+        emit OperatorRemoved(op);
+        arena.removeOperator(op);
+        assertFalse(arena.operators(op));
+    }
+
+    function test_addOperator_revertsIfNotOwner() public {
+        vm.prank(agent1);
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", agent1));
+        arena.addOperator(agent1);
+    }
+
+    // ============ approveBounty / rejectBounty Tests ============
+
+    function test_createBounty_startsPending() public {
+        uint256 bountyId = _createPendingBounty();
+        BountyArena.BountyState memory state = arena.getBountyState(bountyId);
+        assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Pending));
+    }
+
+    function test_approveBounty_success() public {
+        uint256 bountyId = _createPendingBounty();
+
+        vm.expectEmit(true, false, false, true);
+        emit BountyApproved(bountyId);
+        arena.approveBounty(bountyId);
+
+        BountyArena.BountyState memory state = arena.getBountyState(bountyId);
+        assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Active));
+    }
+
+    function test_approveBounty_revertsIfNotOperator() public {
+        uint256 bountyId = _createPendingBounty();
+
+        vm.prank(agent1);
+        vm.expectRevert("not operator");
+        arena.approveBounty(bountyId);
+    }
+
+    function test_approveBounty_revertsIfNotPending() public {
+        uint256 bountyId = _createDefaultBounty(); // already approved (Active)
+
+        vm.expectRevert(abi.encodeWithSelector(
+            BountyArena.InvalidPhase.selector,
+            BountyArena.BountyPhase.Pending,
+            BountyArena.BountyPhase.Active
+        ));
+        arena.approveBounty(bountyId);
+    }
+
+    function test_rejectBounty_refundsCreator() public {
+        uint256 creatorBefore = neuron.balanceOf(creator);
+        uint256 bountyId = _createPendingBounty();
+        assertEq(neuron.balanceOf(creator), creatorBefore - BOUNTY_REWARD);
+
+        vm.expectEmit(true, false, false, false);
+        emit BountyRejected(bountyId, "spam question");
+        arena.rejectBounty(bountyId, "spam question");
+
+        // Creator gets refund
+        assertEq(neuron.balanceOf(creator), creatorBefore);
+
+        // Bounty is Settled with rewardClaimed = true
+        BountyArena.BountyState memory state = arena.getBountyState(bountyId);
+        assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Settled));
+        assertTrue(state.rewardClaimed);
+    }
+
+    function test_rejectBounty_revertsIfNotOperator() public {
+        uint256 bountyId = _createPendingBounty();
+
+        vm.prank(agent1);
+        vm.expectRevert("not operator");
+        arena.rejectBounty(bountyId, "reason");
+    }
+
+    function test_rejectBounty_revertsIfNotPending() public {
+        uint256 bountyId = _createDefaultBounty(); // already approved (Active)
+
+        vm.expectRevert(abi.encodeWithSelector(
+            BountyArena.InvalidPhase.selector,
+            BountyArena.BountyPhase.Pending,
+            BountyArena.BountyPhase.Active
+        ));
+        arena.rejectBounty(bountyId, "reason");
+    }
+
+    function test_joinBounty_revertsIfPending() public {
+        uint256 bountyId = _createPendingBounty();
+
+        vm.prank(agent1);
+        vm.expectRevert(abi.encodeWithSelector(
+            BountyArena.InvalidPhase.selector,
+            BountyArena.BountyPhase.Active,
+            BountyArena.BountyPhase.Pending
+        ));
+        arena.joinBounty(bountyId, agent1Id);
     }
 
     // ============ createBounty Tests ============
@@ -259,7 +395,7 @@ contract BountyArenaTest is Test {
         assertEq(config.difficulty, DEFAULT_DIFFICULTY);
 
         BountyArena.BountyState memory state = arena.getBountyState(bountyId);
-        assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Active));
+        assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Pending));
         assertEq(state.agentCount, 0);
         assertEq(state.answeringAgentCount, 0);
         assertFalse(state.rewardClaimed);
@@ -415,6 +551,7 @@ contract BountyArenaTest is Test {
             DEFAULT_QUESTION, NO_RATING_GATE, DEFAULT_CATEGORY, DEFAULT_DIFFICULTY,
             DURATION, 2, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
 
         _joinBounty(agent1, agent1Id, bountyId);
         _joinBounty(agent2, agent2Id, bountyId);
@@ -1067,6 +1204,11 @@ contract BountyArenaTest is Test {
         );
 
         BountyArena.BountyState memory state = arena.getBountyState(bountyId);
+        assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Pending));
+
+        // Approve bounty
+        arena.approveBounty(bountyId);
+        state = arena.getBountyState(bountyId);
         assertEq(uint8(state.phase), uint8(BountyArena.BountyPhase.Active));
 
         // Agents join
@@ -1431,6 +1573,7 @@ contract BountyArenaTest is Test {
             DEFAULT_QUESTION, NO_RATING_GATE, DEFAULT_CATEGORY, DEFAULT_DIFFICULTY,
             DURATION, 1, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
 
         _joinBounty(agent1, agent1Id, bountyId);
         assertEq(arena.getAgentCount(bountyId), 1);
@@ -1517,11 +1660,13 @@ contract BountyArenaTest is Test {
             DEFAULT_QUESTION, NO_RATING_GATE, DEFAULT_CATEGORY, DEFAULT_DIFFICULTY,
             DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bounty1);
         vm.prank(creator);
         uint256 bounty2 = arena.createBounty(
             DEFAULT_QUESTION, NO_RATING_GATE, DEFAULT_CATEGORY, DEFAULT_DIFFICULTY,
             DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bounty2);
 
         // Contract holds 10 ETH (5 per bounty)
         assertEq(neuron.balanceOf(address(arena)), BOUNTY_REWARD * 2);

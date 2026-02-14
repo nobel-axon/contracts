@@ -38,6 +38,7 @@ contract DeployV2 is Script {
         address neuronToken;
         address reputationRegistry;
         address identityRegistry;
+        address operatorAddress;
         uint256 deployerBalance;
     }
 
@@ -106,6 +107,12 @@ contract DeployV2 is Script {
             config.identityRegistry
         );
 
+        // Add operator if configured
+        if (config.operatorAddress != address(0)) {
+            bountyArena.addOperator(config.operatorAddress);
+            console.log("Operator added:", config.operatorAddress);
+        }
+
         vm.stopBroadcast();
 
         // ============ Post-Deployment Verification ============
@@ -121,6 +128,7 @@ contract DeployV2 is Script {
         config.neuronToken = vm.envAddress("NEURON_TOKEN_ADDRESS");
         config.reputationRegistry = vm.envAddress("REPUTATION_REGISTRY_ADDRESS");
         config.identityRegistry = vm.envAddress("IDENTITY_REGISTRY_ADDRESS");
+        config.operatorAddress = vm.envOr("OPERATOR_ADDRESS", address(0));
         config.deployerBalance = config.deployer.balance;
     }
 
@@ -164,6 +172,11 @@ contract DeployV2 is Script {
         require(ba.nextBountyId() == 1, "FATAL: nextBountyId not initialized");
         console.log("[OK] nextBountyId initialized to 1");
 
+        if (config.operatorAddress != address(0)) {
+            require(ba.operators(config.operatorAddress), "FATAL: Operator not set correctly");
+            console.log("[OK] Operator address verified");
+        }
+
         console.log("");
         console.log("All post-deployment checks passed!");
     }
@@ -195,11 +208,21 @@ contract DeployV2 is Script {
         console.log("");
         console.log("=== Roles ===");
         console.log("Owner (can pause/unpause):", config.deployer);
+        if (config.operatorAddress != address(0)) {
+            console.log("Operator (can approve/reject bounties):", config.operatorAddress);
+        } else {
+            console.log("WARNING: No operator set. Call addOperator() to enable bounty screening.");
+        }
         console.log("");
         console.log("=== Next Steps ===");
         console.log("1. Verify contract on explorer (if --verify failed)");
         console.log("2. Update all service configs with new address");
-        console.log("3. Test with a small bounty before full launch");
+        if (config.operatorAddress == address(0)) {
+            console.log("3. Call addOperator(chiefAddress) to enable bounty screening");
+            console.log("4. Test with a small bounty before full launch");
+        } else {
+            console.log("3. Test with a small bounty before full launch");
+        }
         console.log("");
     }
 }

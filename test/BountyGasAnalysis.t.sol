@@ -44,6 +44,9 @@ contract BountyGasAnalysisTest is Test {
             address(identity)
         );
 
+        // Add test contract as operator
+        arena.addOperator(address(this));
+
         // Fund creator with NEURON
         neuron.mint(creator, 1000 ether);
         vm.prank(creator);
@@ -82,11 +85,36 @@ contract BountyGasAnalysisTest is Test {
         emit log_named_uint("createBounty gas", gasUsed);
     }
 
+    function test_gas_approveBounty() public {
+        vm.prank(creator);
+        uint256 bountyId = arena.createBounty(
+            "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
+        );
+
+        uint256 gasBefore = gasleft();
+        arena.approveBounty(bountyId);
+        uint256 gasUsed = gasBefore - gasleft();
+        emit log_named_uint("approveBounty gas", gasUsed);
+    }
+
+    function test_gas_rejectBounty() public {
+        vm.prank(creator);
+        uint256 bountyId = arena.createBounty(
+            "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
+        );
+
+        uint256 gasBefore = gasleft();
+        arena.rejectBounty(bountyId, "spam question");
+        uint256 gasUsed = gasBefore - gasleft();
+        emit log_named_uint("rejectBounty gas", gasUsed);
+    }
+
     function test_gas_joinBounty() public {
         vm.prank(creator);
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
 
         vm.prank(agents[0]);
         uint256 gasBefore = gasleft();
@@ -100,6 +128,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(5), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
 
         vm.prank(agents[0]);
         uint256 gasBefore = gasleft();
@@ -113,6 +142,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
         vm.prank(agents[1]);
@@ -130,6 +160,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
         vm.prank(agents[1]);
@@ -150,6 +181,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
         vm.prank(agents[1]);
@@ -170,6 +202,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
         vm.prank(agents[0]);
@@ -190,6 +223,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
         vm.prank(agents[1]);
@@ -214,6 +248,7 @@ contract BountyGasAnalysisTest is Test {
         uint256 bountyId = arena.createBounty(
             "Test question", int128(0), "test", 1, DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
+        arena.approveBounty(bountyId);
 
         vm.warp(block.timestamp + DURATION + 1);
 
@@ -235,6 +270,7 @@ contract BountyGasAnalysisTest is Test {
             DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
         totalGas += gasBefore - gasleft();
+        arena.approveBounty(bountyId);
 
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
@@ -268,6 +304,7 @@ contract BountyGasAnalysisTest is Test {
             DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
         totalGas += gasBefore - gasleft();
+        arena.approveBounty(bountyId);
 
         vm.prank(agents[0]);
         arena.joinBounty(bountyId, agentIds[0]);
@@ -305,6 +342,7 @@ contract BountyGasAnalysisTest is Test {
             DURATION, MAX_AGENTS, BOUNTY_REWARD, BASE_ANSWER_FEE
         );
         totalGas += gasBefore - gasleft();
+        arena.approveBounty(bountyId);
 
         vm.warp(block.timestamp + DURATION + 1);
 
